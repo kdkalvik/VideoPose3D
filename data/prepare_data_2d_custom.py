@@ -8,91 +8,60 @@
 import numpy as np
 from glob import glob
 import os
-import sys
-
+import tqdm
 import argparse
-from data_utils import suggest_metadata
-
-output_prefix_2d = 'data_2d_custom_'
+from pose_tracker import pose_tracker
 
 def decode(filename):
-    # Latin1 encoding because Detectron runs on Python 2.7
-    print('Processing {}'.format(filename))
-    data = np.load(filename, encoding='latin1', allow_pickle=True)
-    bb = data['boxes']
-    kp = data['keypoints']
-    metadata = data['metadata'].item()
-    results_bb = []
-    results_kp = []
-    for i in range(len(bb)):
-        if len(bb[i][1]) == 0 or len(kp[i][1]) == 0:
-            # No bbox/keypoints detected for this frame -> will be interpolated
-            results_bb.append(np.full(4, np.nan, dtype=np.float32)) # 4 bounding box coordinates
-            results_kp.append(np.full((17, 4), np.nan, dtype=np.float32)) # 17 COCO keypoints
-            continue
-        best_match = np.argmax(bb[i][1][:, 4])
-        best_bb = bb[i][1][best_match, :4]
-        best_kp = kp[i][1][best_match].T.copy()
-        results_bb.append(best_bb)
-        results_kp.append(best_kp)
-        
-    bb = np.array(results_bb, dtype=np.float32)
-    kp = np.array(results_kp, dtype=np.float32)
-    kp = kp[:, :, :2] # Extract (x, y)
-    
-    # Fix missing bboxes/keypoints by linear interpolation
-    mask = ~np.isnan(bb[:, 0])
-    indices = np.arange(len(bb))
-    for i in range(4):
-        bb[:, i] = np.interp(indices, indices[mask], bb[mask, i])
-    for i in range(17):
-        for j in range(2):
-            kp[:, i, j] = np.interp(indices, indices[mask], kp[mask, i, j])
-    
-    print('{} total frames processed'.format(len(bb)))
-    print('{} frames were interpolated'.format(np.sum(~mask)))
-    print('----------')
-    
-    return [{
-        'start_frame': 0, # Inclusive
-        'end_frame': len(kp), # Exclusive
-        'bounding_boxes': bb,
-        'keypoints': kp,
-    }], metadata
+    data = np.load(filename, allow_pickle=True)
+    metadata =  {'w': 1920, 'h': 1080,}
+    keypoints = data['keypoints']
+    tracker = pose_tracker(data_frame=len(keypoints), num_joint=17)
+    for i, frame in enumerate(keypoints):
+        if len(frame.shape) != 3:
+            print('file has empty skeleton_sequence')
+            return
+        tracker.update(frame, i+1)
+    keypoints = tracker.get_skeleton_sequence()[:, :, :, :2]
+    return keypoints, metadata
 
 
 if __name__ == '__main__':
-    if os.path.basename(os.getcwd()) != 'data':
-        print('This script must be launched from the "data" directory')
-        exit(0)
-        
     parser = argparse.ArgumentParser(description='Custom dataset creator')
-    parser.add_argument('-i', '--input', type=str, default='', metavar='PATH', help='detections directory')
-    parser.add_argument('-o', '--output', type=str, default='', metavar='PATH', help='output suffix for 2D detections')
+    parser.add_argument('-i', '--input',
+                        required=True ,
+                        type=str,
+                        default='',
+                        metavar='PATH',
+                        help='detections directory')
+    parser.add_argument('-o', '--output',
+                        required=True,
+                        type=str,
+                        default='',
+                        metavar='PATH',
+                        help='output filename for 2D detections')
     args = parser.parse_args()
-    
-    if not args.input:
-        print('Please specify the input directory')
-        exit(0)
-        
-    if not args.output:
-        print('Please specify an output suffix (e.g. detectron_pt_coco)')
-        exit(0)
-    
-    print('Parsing 2D detections from', args.input)
-    
-    metadata = suggest_metadata('coco')
-    metadata['video_metadata'] = {}
-    
+
+    metadata = {
+        'layout_name': 'coco',
+        'num_joints': 17,
+        'keypoints_symmetry': [
+            [1, 3, 5, 7, 9, 11, 13, 15],
+            [2, 4, 6, 8, 10, 12, 14, 16],
+        ],
+        'video_metadata': {},
+    }
+
     output = {}
     file_list = glob(args.input + '/*.npz')
-    for f in file_list:
+    file_list = [f for f in file_list]
+    for f in tqdm.tqdm(file_list):
         canonical_name = os.path.splitext(os.path.basename(f))[0]
-        data, video_metadata = decode(f)
+        keypoints, video_metadata = decode(f)
         output[canonical_name] = {}
-        output[canonical_name]['custom'] = [data[0]['keypoints'].astype('float32')]
+        output[canonical_name]['custom'] = [keypoints]
         metadata['video_metadata'][canonical_name] = video_metadata
 
     print('Saving...')
-    np.savez_compressed(output_prefix_2d + args.output, positions_2d=output, metadata=metadata)
+    np.savez_compressed(args.output, positions_2d=output, metadata=metadata)
     print('Done.')
